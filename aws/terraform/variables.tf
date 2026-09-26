@@ -22,3 +22,9 @@ variable "s3_bucket" {
   description = "The bucket holding persistent world saves"
   type        = string
 }
+
+variable "discord_webhook_url" {
+  description = "Discord Webhook URL for server status notifications"
+  type        = string
+  default     = "https://discord.com/api/webhooks/1553413008590381126/c0ISqZK5Y6j32QJbbIeVR5WByvE-jGL3Mm_eo8FTy6tVCvnC6LAxIJioBn-yXhQgspz3"
+}

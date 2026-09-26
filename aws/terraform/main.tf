@@ -105,8 +105,9 @@ resource "aws_instance" "mc_server" {
 
   # Injects our bash script and variables dynamically
   user_data = templatefile("${path.module}/../scripts/server_bootstrap.sh", {
-    s3_bucket  = var.s3_bucket
-    project_id = var.curseforge_project_id
+    s3_bucket           = var.s3_bucket
+    project_id          = var.curseforge_project_id
+    discord_webhook_url = var.discord_webhook_url
   })
 
   tags = { Name = "Minecraft-Ephemeral-Server" }
