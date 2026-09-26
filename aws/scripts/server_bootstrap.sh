@@ -4,7 +4,6 @@ set -e
 exec > >(tee /var/log/server_bootstrap.log) 2>&1
 echo "Starting Minecraft bootstrap process..."
 
-# Variables injected by Terraform templatefile
 S3_BUCKET="${s3_bucket}"
 PROJECT_ID="${project_id}"
 DISCORD_WEBHOOK_URL="${discord_webhook_url}"
@@ -29,7 +28,6 @@ send_discord_alert() {
   fi
 }
 
-# Announce Boot Initiation
 send_discord_alert "Server Launching" "Provisioning AWS Instance for Modpack ID: \`$PROJECT_ID\`. Bootstrapping environment..." 3447003
 
 # 1. Update system & install deps
@@ -42,17 +40,32 @@ useradd -r -m -U -d /opt/minecraft -s /bin/bash minecraft
 mkdir -p /opt/minecraft/server
 chown minecraft:minecraft /opt/minecraft/server
 
-# 2. Install Ferium for ARM64
+# 2. Install Ferium
 wget -q "https://github.com/gorilla-devs/ferium/releases/latest/download/ferium-linux-arm64-nogui.zip" -O /tmp/ferium.zip
 unzip -o /tmp/ferium.zip -d /usr/local/bin/
 chmod +x /usr/local/bin/ferium
 
-# 3. Restore world from S3 if it exists
+# 3. Restore world and configurations from S3
 aws s3 cp s3://$S3_BUCKET/$PROJECT_ID/world.tar.gz /tmp/world.tar.gz || echo "No previous world found."
 if [ -f /tmp/world.tar.gz ]; then
   tar -xzf /tmp/world.tar.gz -C /opt/minecraft/server
-  chown -R minecraft:minecraft /opt/minecraft/server/world
 fi
+
+# Sync configs (Feature D)
+aws s3 sync s3://$S3_BUCKET/$PROJECT_ID/config/ /opt/minecraft/server/ || echo "No existing configs found in S3."
+
+# Ensure fallback server.properties exists if not downloaded
+if [ ! -f /opt/minecraft/server/server.properties ]; then
+  cat << 'EOF' > /opt/minecraft/server/server.properties
+enable-command-block=true
+spawn-protection=0
+view-distance=10
+difficulty=normal
+motd=Ephemeral Modded Minecraft Server
+EOF
+fi
+
+chown -R minecraft:minecraft /opt/minecraft/server
 
 # 4. Add modpack via Ferium
 sudo -u minecraft bash -c "
@@ -62,19 +75,15 @@ sudo -u minecraft bash -c "
   ferium modpack upgrade
 "
 
-# 5. Parse CurseForge manifest.json
+# 5. Parse Manifest & Install Loader
 cd /opt/minecraft/server
 if [ ! -f manifest.json ]; then
-  echo "Error: manifest.json not found! Modpack download failed."
   send_discord_alert "Server Launch Failed" "Critical Error: \`manifest.json\` not found after Ferium download." 16711680
   exit 1
 fi
 
 MC_VERSION=$(jq -r '.minecraft.version' manifest.json)
 LOADER_ID=$(jq -r '.minecraft.modLoaders[0].id' manifest.json)
-echo "Detected Minecraft Version: $MC_VERSION \vert{} Loader:$LOADER_ID"
-
-# 6. Dynamic Loader Installation
 JAVA_CMD="/usr/bin/java"
 
 if [[ "$LOADER_ID" == fabric-* ]]; then
@@ -113,13 +122,19 @@ fi
 echo "eula=true" > eula.txt
 chown -R minecraft:minecraft /opt/minecraft/server
 
-# 7. Create S3 Backup Script (Fires when server stops)
+# 6. Create Backup Script
 cat << SCRIPT > /opt/minecraft/server/backup.sh
 #!/bin/bash
 echo "Zipping world data..."
 tar -czf /tmp/world.tar.gz -C /opt/minecraft/server world
-echo "Uploading to S3..."
 aws s3 cp /tmp/world.tar.gz s3://$S3_BUCKET/$PROJECT_ID/world.tar.gz
+
+# Backup configs (Feature D)
+for file in server.properties ops.json whitelist.json banned-players.json banned-ips.json usercache.json; do
+  if [ -f /opt/minecraft/server/\$file ]; then
+    aws s3 cp /opt/minecraft/server/\$file s3://$S3_BUCKET/$PROJECT_ID/config/\$file
+  fi
+done
 
 curl -s -H "Content-Type: application/json" -X POST \
   -d '{"embeds": [{"title": "Server Offline", "description": "World safely backed up to S3. EC2 instance terminating.", "color": 16711680, "timestamp": "'\$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}]}' \
@@ -128,7 +143,7 @@ SCRIPT
 chmod +x /opt/minecraft/server/backup.sh
 chown minecraft:minecraft /opt/minecraft/server/backup.sh
 
-# 8. Setup Systemd Service
+# 7. Setup Systemd Service
 cat << SERVICE > /etc/systemd/system/minecraft.service
 [Unit]
 Description=Minecraft Server
@@ -146,8 +161,7 @@ ExecStopPost=/opt/minecraft/server/backup.sh
 WantedBy=multi-user.target
 SERVICE
 
-# 9. Create Online Notifier Script
-# This waits for the server to bind to port 25565, grabs the public IP, and notifies Discord
+# 8. Setup Online Notifier
 cat << SCRIPT > /opt/minecraft/discord_notifier.sh
 #!/bin/bash
 PUBLIC_IP=\$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
@@ -174,7 +188,7 @@ ExecStart=/opt/minecraft/discord_notifier.sh
 WantedBy=multi-user.target
 SERVICE
 
-# 10. Auto-shutdown daemon
+# 9. Setup Auto-shutdown daemon
 cat << 'EOF' > /opt/minecraft/autoshutdown.sh
 #!/bin/bash
 IDLE_LIMIT=20
@@ -219,7 +233,7 @@ RestartSec=30s
 WantedBy=multi-user.target
 SERVICE
 
-# Start Services
+# 10. Start Services
 systemctl daemon-reload
 systemctl enable minecraft minecraft-notifier minecraft-autoshutdown
 systemctl start minecraft
