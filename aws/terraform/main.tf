@@ -95,6 +95,9 @@ resource "aws_instance" "mc_server" {
   vpc_security_group_ids = [aws_security_group.mc_sg.id]
   iam_instance_profile   = aws_iam_instance_profile.mc_profile.name
 
+  # Automatically terminate instance when OS triggers poweroff
+  instance_initiated_shutdown_behavior = "terminate"
+
   root_block_device {
     volume_type = "gp3"
     volume_size = 15

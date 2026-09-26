@@ -109,6 +109,76 @@ SCRIPT
 chmod +x /opt/minecraft/server/backup.sh
 chown minecraft:minecraft /opt/minecraft/server/backup.sh
 
+# --- AUTO-SHUTDOWN SETUP ---
+# Install mcstatus CLI to query player counts locally
+apt-get install -y python3-pip
+pip3 install --break-system-packages mcstatus
+
+# Create the monitor script
+cat << 'EOF' > /opt/minecraft/autoshutdown.sh
+#!/bin/bash
+# Configuration
+IDLE_LIMIT=20            # Minutes of inactivity before triggering shutdown
+CHECK_INTERVAL=60        # Check every 60 seconds
+INITIAL_GRACE_PERIOD=900 # 15-minute grace period on boot for server start & player login
+
+echo "Auto-shutdown daemon started. Sleeping for $INITIAL_GRACE_PERIOD seconds grace period..."
+sleep $INITIAL_GRACE_PERIOD
+
+IDLE_MINUTES=0
+
+while true; do
+  # Query player count from the local server
+  ONLINE=$(mcstatus 127.0.0.1:25565 json 2>/dev/null | jq -r '.players.online // empty')
+
+  if [ -z "$ONLINE" ]; then
+    # Server might be restarting or loading dimensions
+    echo "Could not reach server on 25565. Waiting..."
+  elif [ "$ONLINE" -eq 0 ]; then
+    IDLE_MINUTES=$((IDLE_MINUTES + 1))
+    echo "Server empty ($IDLE_MINUTES/$IDLE_LIMIT minutes idle)."
+  else
+    if [ "$IDLE_MINUTES" -ne 0 ]; then
+      echo "Player detected ($ONLINE online). Resetting idle timer."
+    fi
+    IDLE_MINUTES=0
+  fi
+
+  if [ "$IDLE_MINUTES" -ge "$IDLE_LIMIT" ]; then
+    echo "Inactivity threshold reached. Stopping Minecraft and terminating instance..."
+    systemctl stop minecraft
+    shutdown -h now
+    exit 0
+  fi
+
+  sleep $CHECK_INTERVAL
+done
+EOF
+
+chmod +x /opt/minecraft/autoshutdown.sh
+chown minecraft:minecraft /opt/minecraft/autoshutdown.sh
+
+# Register the auto-shutdown background service
+cat << 'SERVICE' > /etc/systemd/system/minecraft-autoshutdown.service
+[Unit]
+Description=Minecraft Inactivity Auto-Shutdown
+After=minecraft.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/minecraft/autoshutdown.sh
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable minecraft-autoshutdown
+systemctl start minecraft-autoshutdown
+
 # 9. Setup Systemd Service
 cat << SERVICE > /etc/systemd/system/minecraft.service
 [Unit]
