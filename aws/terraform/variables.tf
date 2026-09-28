@@ -28,3 +28,9 @@ variable "discord_webhook_url" {
   type        = string
   default     = "https://discord.com/api/webhooks/1553413008590381126/c0ISqZK5Y6j32QJbbIeVR5WByvE-jGL3Mm_eo8FTy6tVCvnC6LAxIJioBn-yXhQgspz3"
 }
+
+variable "s3_enabled" {
+  description = "Flag to determine if the AWS CLI and S3 backups should be used"
+  type        = string
+  default     = "true"
+}

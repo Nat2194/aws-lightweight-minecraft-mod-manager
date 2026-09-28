@@ -1,11 +1,23 @@
 #!/bin/bash
 
+# 1. Setup automatic logging to both console and file
+LOG_FILE="last_run.log"
+exec > >(tee "$LOG_FILE") 2>&1
+
 echo "[INFO] Starting Minecraft Ephemeral Server Manager..."
+
+# Function to pause before exiting so the window doesn't instantly close
+pause_and_exit() {
+    echo ""
+    read -n 1 -s -r -p "Press any key to exit..."
+    echo ""
+    exit $1
+}
 
 if [[ $# -lt 2 ]]; then
     echo "[ERROR] Missing arguments."
     echo "Usage: ./manager.sh [up|down] <curseforge_project_id> [--skip-bucket]"
-    exit 1
+    pause_and_exit 1
 fi
 
 ACTION=$1
@@ -14,7 +26,7 @@ FLAG=$3
 
 if ! command -v aws &> /dev/null || ! command -v terraform &> /dev/null; then
     echo "[ERROR] AWS CLI or Terraform is missing from your system."
-    exit 1
+    pause_and_exit 1
 fi
 
 if [ -f .env ]; then
@@ -30,17 +42,19 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>&1)
 if [[ $? -ne 0 ]]; then
     echo "[ERROR] AWS Authentication failed. Check your .env file."
     echo "$ACCOUNT_ID"
-    exit 1
+    pause_and_exit 1
 fi
 echo "[SUCCESS] Authenticated successfully (Account ID: $ACCOUNT_ID)."
 
 BUCKET_NAME="mc-ephemeral-worlds-${ACCOUNT_ID}"
+export TF_VAR_s3_enabled="true"
 
 if [ "$ACTION" == "up" ]; then
     echo "[INFO] Checking S3 bucket status..."
     if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
         if [ "$FLAG" == "--skip-bucket" ]; then
             echo "[INFO] Skipping S3 bucket creation (--skip-bucket)."
+            export TF_VAR_s3_enabled="false"
         else
             echo "[WARN] S3 bucket '$BUCKET_NAME' does not exist."
             read -p "Do you want to create it now for world backups? (y/n) " -n 1 -r
@@ -48,18 +62,20 @@ if [ "$ACTION" == "up" ]; then
             if [[ $REPLY =~ ^[Yy]$ ]]; then
                 aws s3 mb s3://"$BUCKET_NAME"
                 echo "[SUCCESS] Bucket created."
+            else
+                export TF_VAR_s3_enabled="false"
+                echo "[WARN] Running without an S3 bucket. World saves and configs will NOT be backed up!"
             fi
         fi
     fi
 
-    cd terraform || exit
+    cd terraform || pause_and_exit 1
     echo "[INFO] Initializing Terraform..."
     terraform init -upgrade > /dev/null
 
     echo "======================================================"
     echo "             AWS CHANGES TO BE APPLIED                "
     echo "======================================================"
-    # Generates and prints the exact plan of what AWS resources will be created
     terraform plan -var="curseforge_project_id=$PROJECT_ID" -var="s3_bucket=$BUCKET_NAME" -out=tfplan
     echo "======================================================"
     
@@ -71,16 +87,15 @@ if [ "$ACTION" == "up" ]; then
         echo "[SUCCESS] Deployment finished! Check Discord or wait 5 minutes to connect."
     else
         echo "[INFO] Deployment cancelled."
-        exit 0
+        pause_and_exit 0
     fi
     cd ..
 
 elif [ "$ACTION" == "down" ]; then
-    cd terraform || exit
+    cd terraform || pause_and_exit 1
     echo "======================================================"
     echo "            AWS RESOURCES TO BE DESTROYED             "
     echo "======================================================"
-    # Shows exactly what will be deleted to stop billing
     terraform plan -destroy -var="curseforge_project_id=$PROJECT_ID" -var="s3_bucket=$BUCKET_NAME"
     echo "======================================================"
     
@@ -92,10 +107,12 @@ elif [ "$ACTION" == "down" ]; then
         echo "[SUCCESS] Infrastructure destroyed. Billing stopped."
     else
         echo "[INFO] Teardown cancelled."
-        exit 0
+        pause_and_exit 0
     fi
     cd ..
 else
     echo "[ERROR] Invalid action. Use 'up' or 'down'."
-    exit 1
+    pause_and_exit 1
 fi
+
+pause_and_exit 0

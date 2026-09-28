@@ -129,6 +129,7 @@ resource "aws_instance" "mc_server" {
     s3_bucket           = var.s3_bucket
     project_id          = var.curseforge_project_id
     discord_webhook_url = var.discord_webhook_url
+    s3_enabled          = var.s3_enabled
   })
 
   tags = { Name = "Minecraft-Ephemeral-Server" }

@@ -7,24 +7,15 @@ echo "Starting Minecraft bootstrap process..."
 S3_BUCKET="${s3_bucket}"
 PROJECT_ID="${project_id}"
 DISCORD_WEBHOOK_URL="${discord_webhook_url}"
+S3_ENABLED="${s3_enabled}"
 
 # --- DISCORD HELPER FUNCTION ---
 send_discord_alert() {
   local title="$1"
   local description="$2"
   local color="$3"
-  
   if [ -n "$DISCORD_WEBHOOK_URL" ]; then
-    curl -s -H "Content-Type: application/json" \
-      -X POST \
-      -d '{
-        "embeds": [{
-          "title": "'"$title"'",
-          "description": "'"$description"'",
-          "color": '"$color"',
-          "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
-        }]
-      }' "$DISCORD_WEBHOOK_URL" > /dev/null
+    curl -s -H "Content-Type: application/json" -X POST -d '{"embeds": [{"title": "'"$title"'", "description": "'"$description"'", "color": '"$color"', "timestamp": "'$(date -u +\%Y-\%m-\%dT\%H:\%M:\%SZ)'"}]}' "$DISCORD_WEBHOOK_URL" > /dev/null
   fi
 }
 
@@ -33,8 +24,17 @@ send_discord_alert "Server Launching" "Provisioning AWS Instance for Modpack ID:
 # 1. Update system & install deps
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y openjdk-21-jre-headless openjdk-17-jre-headless unzip wget curl jq awscli tar python3-pip
+apt-get install -y openjdk-21-jre-headless openjdk-17-jre-headless unzip wget curl jq tar python3-pip expect
 pip3 install --break-system-packages mcstatus
+
+# Conditionally install AWS CLI
+if [ "$S3_ENABLED" == "true" ]; then
+  echo "S3 Enabled: Installing AWS CLI..."
+  curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "/tmp/awscliv2.zip"
+  unzip -q /tmp/awscliv2.zip -d /tmp/
+  /tmp/aws/install
+  rm -rf /tmp/awscliv2.zip /tmp/aws
+fi
 
 useradd -r -m -U -d /opt/minecraft -s /bin/bash minecraft
 mkdir -p /opt/minecraft/server
@@ -45,16 +45,16 @@ wget -q "https://github.com/gorilla-devs/ferium/releases/latest/download/ferium-
 unzip -o /tmp/ferium.zip -d /usr/local/bin/
 chmod +x /usr/local/bin/ferium
 
-# 3. Restore world and configurations from S3
-aws s3 cp s3://$S3_BUCKET/$PROJECT_ID/world.tar.gz /tmp/world.tar.gz || echo "No previous world found."
-if [ -f /tmp/world.tar.gz ]; then
-  tar -xzf /tmp/world.tar.gz -C /opt/minecraft/server
+# 3. Conditionally restore world and configurations from S3
+if [ "$S3_ENABLED" == "true" ]; then
+  echo "Restoring data from S3..."
+  aws s3 cp s3://$S3_BUCKET/$PROJECT_ID/world.tar.gz /tmp/world.tar.gz || echo "No previous world found."
+  if [ -f /tmp/world.tar.gz ]; then
+    tar -xzf /tmp/world.tar.gz -C /opt/minecraft/server
+  fi
+  aws s3 sync s3://$S3_BUCKET/$PROJECT_ID/config/ /opt/minecraft/server/ || echo "No existing configs found in S3."
 fi
 
-# Sync configs (Feature D)
-aws s3 sync s3://$S3_BUCKET/$PROJECT_ID/config/ /opt/minecraft/server/ || echo "No existing configs found in S3."
-
-# Ensure fallback server.properties exists if not downloaded
 if [ ! -f /opt/minecraft/server/server.properties ]; then
   cat << 'EOF' > /opt/minecraft/server/server.properties
 enable-command-block=true
@@ -67,13 +67,41 @@ fi
 
 chown -R minecraft:minecraft /opt/minecraft/server
 
-# 4. Add modpack via Ferium
-sudo -u minecraft bash -c "
-  cd /opt/minecraft/server
-  mkdir -p ~/.config/ferium
-  echo -e \"/opt/minecraft/server\ny\n\" | ferium modpack add $PROJECT_ID
-  ferium modpack upgrade
+# 4. Add modpack via Ferium using Expect to handle prompts
+sudo -u minecraft mkdir -p /opt/minecraft/.config/ferium
+
+sudo -u minecraft expect -c "
+  set timeout 30
+  spawn ferium modpack add $PROJECT_ID
+  expect {
+    -nocase \"output directory\" {
+      send \"/opt/minecraft/server\r\"
+      exp_continue
+    }
+    -nocase \"overrides\" {
+      send \"y\r\"
+      exp_continue
+    }
+    eof
+  }
 "
+
+# Now that it's configured, upgrade to download the files
+cd /opt/minecraft/server
+sudo -u minecraft ferium modpack upgrade
+
+# --- BLOCKED MODS WORKAROUND ---
+# CurseForge blocks some mods from 3rd party API downloads. 
+# If playing Lucky World Invasion Reloaded, fetch them directly from the CDN.
+if [ "$PROJECT_ID" == "1108726" ]; then
+  echo "Downloading blocked mods for Lucky World Invasion Reloaded..."
+  mkdir -p /opt/minecraft/server/mods
+  cd /opt/minecraft/server/mods
+  sudo -u minecraft curl -sL -A "Mozilla/5.0" -O "https://edge.forgecdn.net/files/4817/267/LuckyBlock-1.20.1-13.0.jar"
+  sudo -u minecraft curl -sL -A "Mozilla/5.0" -O "https://edge.forgecdn.net/files/6352/681/yakurum-1.20.1-1.4.1.jar"
+  sudo -u minecraft curl -sL -A "Mozilla/5.0" -O "https://edge.forgecdn.net/files/8053/757/entityculling-forge-1.6.7-mc1.20.1.jar"
+  cd /opt/minecraft/server
+fi
 
 # 5. Parse Manifest & Install Loader
 cd /opt/minecraft/server
@@ -122,23 +150,24 @@ fi
 echo "eula=true" > eula.txt
 chown -R minecraft:minecraft /opt/minecraft/server
 
-# 6. Create Backup Script
+# 6. Create Backup Script (Conditionally uploads to S3)
 cat << SCRIPT > /opt/minecraft/server/backup.sh
 #!/bin/bash
-echo "Zipping world data..."
-tar -czf /tmp/world.tar.gz -C /opt/minecraft/server world
-aws s3 cp /tmp/world.tar.gz s3://$S3_BUCKET/$PROJECT_ID/world.tar.gz
+if [ "$S3_ENABLED" == "true" ]; then
+  echo "Zipping world data..."
+  tar -czf /tmp/world.tar.gz -C /opt/minecraft/server world
+  aws s3 cp /tmp/world.tar.gz s3://$S3_BUCKET/$PROJECT_ID/world.tar.gz
 
-# Backup configs (Feature D)
-for file in server.properties ops.json whitelist.json banned-players.json banned-ips.json usercache.json; do
-  if [ -f /opt/minecraft/server/\$file ]; then
-    aws s3 cp /opt/minecraft/server/\$file s3://$S3_BUCKET/$PROJECT_ID/config/\$file
-  fi
-done
-
-curl -s -H "Content-Type: application/json" -X POST \
-  -d '{"embeds": [{"title": "Server Offline", "description": "World safely backed up to S3. EC2 instance terminating.", "color": 16711680, "timestamp": "'\$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}]}' \
-  "$DISCORD_WEBHOOK_URL" > /dev/null
+  for file in server.properties ops.json whitelist.json banned-players.json banned-ips.json usercache.json; do
+    if [ -f /opt/minecraft/server/\$file ]; then
+      aws s3 cp /opt/minecraft/server/\$file s3://$S3_BUCKET/$PROJECT_ID/config/\$file
+    fi
+  done
+  curl -s -H "Content-Type: application/json" -X POST -d '{"embeds": [{"title": "Server Offline", "description": "World safely backed up to S3. EC2 instance terminating.", "color": 16711680, "timestamp": "'\$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}]}' "$DISCORD_WEBHOOK_URL" > /dev/null
+else
+  echo "S3 Backup disabled. Skipping world upload."
+  curl -s -H "Content-Type: application/json" -X POST -d '{"embeds": [{"title": "Server Offline", "description": "EC2 instance terminating. No world backup was created.", "color": 16711680, "timestamp": "'\$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}]}' "$DISCORD_WEBHOOK_URL" > /dev/null
+fi
 SCRIPT
 chmod +x /opt/minecraft/server/backup.sh
 chown minecraft:minecraft /opt/minecraft/server/backup.sh
