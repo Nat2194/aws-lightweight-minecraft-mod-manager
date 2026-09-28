@@ -1,8 +1,14 @@
 #!/bin/bash
-set -e
 
 exec > >(tee /var/log/server_bootstrap.log) 2>&1
 echo "Starting Minecraft bootstrap process..."
+
+# 0. Create Directory and Install Debug Script IMMEDIATELY 
+mkdir -p /opt/minecraft
+cat << 'EOF' > /opt/minecraft/debug.sh
+${debug_script_content}
+EOF
+chmod +x /opt/minecraft/debug.sh
 
 S3_BUCKET="${s3_bucket}"
 PROJECT_ID="${project_id}"
@@ -41,7 +47,7 @@ fi
 
 useradd -r -m -U -d /opt/minecraft -s /bin/bash minecraft
 mkdir -p /opt/minecraft/server
-chown minecraft:minecraft /opt/minecraft/server
+chown -R minecraft:minecraft /opt/minecraft
 
 # 2. Install Ferium
 wget -q "https://github.com/gorilla-devs/ferium/releases/latest/download/ferium-linux-arm64-nogui.zip" -O /tmp/ferium.zip
@@ -71,9 +77,9 @@ fi
 chown -R minecraft:minecraft /opt/minecraft/server
 
 # 4. Add modpack via Ferium using sequential Expect to handle prompts
-sudo -u minecraft mkdir -p /opt/minecraft/.config/ferium
+sudo -H -u minecraft mkdir -p /opt/minecraft/.config/ferium
 
-sudo -u minecraft expect -c "
+sudo -H -u minecraft expect -c "
   set timeout 60
   spawn ferium modpack add $PROJECT_ID
   
@@ -88,74 +94,103 @@ sudo -u minecraft expect -c "
   expect eof
 "
 
-# Now that it's configured, upgrade to download the files
+# Upgrade and capture the output to a log file
 cd /opt/minecraft/server
-sudo -u minecraft ferium modpack upgrade
+sudo -H -u minecraft ferium modpack upgrade | tee /tmp/ferium_upgrade.log
 
-# --- BLOCKED MODS WORKAROUND ---
-# CurseForge blocks some mods from 3rd party API downloads. 
-# If playing Lucky World Invasion Reloaded, fetch them directly from the CDN.
-if [ "$PROJECT_ID" == "1108726" ]; then
-  echo "Downloading blocked mods for Lucky World Invasion Reloaded..."
-  mkdir -p /opt/minecraft/server/mods
-  cd /opt/minecraft/server/mods
-  sudo -u minecraft curl -sL -A "Mozilla/5.0" -O "https://edge.forgecdn.net/files/4817/267/LuckyBlock-1.20.1-13.0.jar"
-  sudo -u minecraft curl -sL -A "Mozilla/5.0" -O "https://edge.forgecdn.net/files/6352/681/yakurum-1.20.1-1.4.1.jar"
-  sudo -u minecraft curl -sL -A "Mozilla/5.0" -O "https://edge.forgecdn.net/files/8053/757/entityculling-forge-1.6.7-mc1.20.1.jar"
-  cd /opt/minecraft/server
+# Strip ANSI colors from the log so we can cleanly parse it
+FERIUM_OUT=$(cat /tmp/ferium_upgrade.log | sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,2})?)?[mGK]//g")
+
+# --- DYNAMIC BLOCKED MODS DOWNLOADER ---
+# Extract all CurseForge URLs for blocked mods and texture packs
+BLOCKED_URLS=$(echo "$FERIUM_OUT" | grep -oP "https://www.curseforge.com/minecraft/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+/download/[0-9]+")
+
+if [ -n "$BLOCKED_URLS" ]; then
+    echo "Attempting to dynamically download blocked files via CFWidget + Edge CDN..."
+    mkdir -p /opt/minecraft/server/mods
+    
+    for URL in $BLOCKED_URLS; do
+        CATEGORY=$(echo "$URL" | awk -F'/' '{print $5}')
+        SLUG=$(echo "$URL" | awk -F'/' '{print $6}')
+        FILE_ID=$(echo "$URL" | awk -F'/' '{print $8}')
+        
+        echo "Resolving filename for $SLUG..."
+        sleep 1 # Respect API rate limits
+        
+        # Fetch the exact filename from CFWidget's public index
+        FILENAME=$(curl -s "https://api.cfwidget.com/minecraft/$CATEGORY/$SLUG" | jq -r ".files[]? | select(.id==$FILE_ID) | .name")
+        
+        if [ -n "$FILENAME" ] && [ "$FILENAME" != "null" ]; then
+            ENCODED_FILENAME=$(jq -rn --arg x "$FILENAME" '$x|@uri')
+            
+            # Calculate the CurseForge Edge CDN path (File ID divided by 1000)
+            PART1=$((FILE_ID / 1000))
+            PART2=$((FILE_ID % 1000))
+            PART2_PADDED=$(printf "%03d" $PART2)
+            
+            CDN_URL="https://edge.forgecdn.net/files/$PART1/$PART2_PADDED/$ENCODED_FILENAME"
+            
+            echo "Downloading $FILENAME from Edge CDN..."
+            sudo -H -u minecraft curl -sL -A "Mozilla/5.0" -o "/opt/minecraft/server/mods/$FILENAME" "$CDN_URL"
+        else
+            echo "[WARN] Could not resolve filename for $SLUG. Skipping."
+        fi
+    done
 fi
 
-# 5. Parse Manifest & Install Loader
+# 5. Parse Versions & Install Loader
 cd /opt/minecraft/server
 
-# Ferium does not extract manifest.json, so we provide fallback parameters
-if [ ! -f manifest.json ]; then
-  echo "manifest.json not found. Checking known parameters for Project ID $PROJECT_ID..."
-  if [ "$PROJECT_ID" == "1108726" ]; then
-    MC_VERSION="1.20.1"
-    # Forge 47.3.0 is the stable standard for 1.20.1 modpacks
-    LOADER_ID="forge-47.3.0"
+# Extract versions directly from Ferium's text output
+MC_VERSION=$(echo "$FERIUM_OUT" | grep -oP "using Minecraft \K[0-9]+\.[0-9]+(\.[0-9]+)?")
+LOADER_ID=$(echo "$FERIUM_OUT" | grep -oP "with \K[a-z]+-[0-9]+\.[0-9]+(\.[0-9]+(\.[0-9]+)?)?")
+
+# Fallback to manifest if Ferium's text format changes
+if [ -z "$MC_VERSION" ] || [ -z "$LOADER_ID" ]; then
+  if [ -f manifest.json ]; then
+    MC_VERSION=$(jq -r '.minecraft.version' manifest.json)
+    LOADER_ID=$(jq -r '.minecraft.modLoaders[0].id' manifest.json)
   else
-    send_discord_alert "Server Launch Failed" "Critical Error: \`manifest.json\` not found, and no fallback provided for ID $PROJECT_ID." 16711680
+    send_discord_alert "Server Launch Failed" "Critical Error: Could not determine Minecraft and Loader versions." 16711680
     exit 1
   fi
-else
-  MC_VERSION=$(jq -r '.minecraft.version' manifest.json)
-  LOADER_ID=$(jq -r '.minecraft.modLoaders[0].id' manifest.json)
 fi
 
-JAVA_CMD="/usr/bin/java"
+echo "Detected Minecraft Version: $MC_VERSION"
+echo "Detected Loader: $LOADER_ID"
+
+JAVA_CMD="/usr/lib/jvm/java-17-openjdk-arm64/bin/java"
 
 if [[ "$LOADER_ID" == fabric-* ]]; then
-    LOADER_VERSION=$(echo$LOADER_ID | cut -d'-' -f 2)
+    LOADER_VERSION=$(echo $LOADER_ID | cut -d'-' -f 2)
     wget -qO fabric-installer.jar https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.0.1/fabric-installer-1.0.1.jar
     sudo -u minecraft $JAVA_CMD -jar fabric-installer.jar server -mcversion "$MC_VERSION" -loader "$LOADER_VERSION" -downloadMinecraft
-    START_CMD="$JAVA_CMD -Xmx1500M -Xms512M -jar fabric-server-launch.jar nogui"
+    START_CMD="$JAVA_CMD -Xmx6500M -Xms1024M -jar fabric-server-launch.jar nogui"
     
 elif [[ "$LOADER_ID" == forge-* ]]; then
-    LOADER_VERSION=$(echo$LOADER_ID | cut -d'-' -f 2)
+    LOADER_VERSION=$(echo $LOADER_ID | cut -d'-' -f 2)
     wget -qO forge-installer.jar "https://maven.minecraftforge.net/net/minecraftforge/forge/$MC_VERSION-$LOADER_VERSION/forge-$MC_VERSION-$LOADER_VERSION-installer.jar"
     sudo -u minecraft $JAVA_CMD -jar forge-installer.jar --installServer
     if [ -f run.sh ]; then
-        echo "-Xmx1500M" > user_jvm_args.txt
-        echo "-Xms512M" >> user_jvm_args.txt
+        echo "-Xmx6500M" > user_jvm_args.txt
+        echo "-Xms1024M" >> user_jvm_args.txt
         START_CMD="bash run.sh"
     else
         START_JAR=$(ls forge-*.jar | head -n 1)
-        START_CMD="$JAVA_CMD -Xmx1500M -Xms512M -jar$START_JAR nogui"
+        START_CMD="$JAVA_CMD -Xmx6500M -Xms1024M -jar $START_JAR nogui"
     fi
     
 elif [[ "$LOADER_ID" == neoforge-* ]]; then
-    LOADER_VERSION=$(echo$LOADER_ID | cut -d'-' -f 2)
+    LOADER_VERSION=$(echo $LOADER_ID | cut -d'-' -f 2)
     wget -qO neoforge-installer.jar "https://maven.neoforged.net/releases/net/neoforged/neoforge/$LOADER_VERSION/neoforge-$LOADER_VERSION-installer.jar"
     sudo -u minecraft $JAVA_CMD -jar neoforge-installer.jar --installServer
     if [ -f run.sh ]; then
-        echo "-Xmx1500M" > user_jvm_args.txt
-        echo "-Xms512M" >> user_jvm_args.txt
+        echo "-Xmx6500M" > user_jvm_args.txt
+        echo "-Xms1024M" >> user_jvm_args.txt
         START_CMD="bash run.sh"
     else
         START_JAR=$(ls neoforge-*.jar | head -n 1)
-        START_CMD="$JAVA_CMD -Xmx1500M -Xms512M -jar$START_JAR nogui"
+        START_CMD="$JAVA_CMD -Xmx6500M -Xms1024M -jar $START_JAR nogui"
     fi
 fi
 
@@ -274,14 +309,7 @@ RestartSec=30s
 WantedBy=multi-user.target
 SERVICE
 
-# 10. Install Debug Script
-cat << 'EOF' > /opt/minecraft/debug.sh
-${debug_script_content}
-EOF
-chmod +x /opt/minecraft/debug.sh
-chown root:root /opt/minecraft/debug.sh
-
-# 11. Start Services
+# 10. Start Services
 systemctl daemon-reload
 systemctl enable minecraft minecraft-notifier minecraft-autoshutdown
 systemctl start minecraft
