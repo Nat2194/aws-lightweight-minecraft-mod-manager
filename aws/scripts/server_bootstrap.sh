@@ -19,13 +19,16 @@ send_discord_alert() {
   fi
 }
 
-send_discord_alert "Server Launching" "Provisioning AWS Instance for Modpack ID: \`$PROJECT_ID\`. Bootstrapping environment..." 3447003
 
 # 1. Update system & install deps
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y openjdk-21-jre-headless openjdk-17-jre-headless unzip wget curl jq tar python3-pip expect
 pip3 install --break-system-packages mcstatus
+
+# Fetch IP securely and send Discord Launch Alert
+PUBLIC_IP=$(curl -s --retry 5 --retry-delay 2 checkip.amazonaws.com)
+send_discord_alert "Server Launching" "Provisioning AWS Instance for Modpack ID: \`$PROJECT_ID\`.\n\n**IP Address:** \`$PUBLIC_IP:25565\`\n\nBootstrapping environment (this takes 3-5 minutes)..." 3447003
 
 # Conditionally install AWS CLI
 if [ "$S3_ENABLED" == "true" ]; then
@@ -67,23 +70,22 @@ fi
 
 chown -R minecraft:minecraft /opt/minecraft/server
 
-# 4. Add modpack via Ferium using Expect to handle prompts
+# 4. Add modpack via Ferium using sequential Expect to handle prompts
 sudo -u minecraft mkdir -p /opt/minecraft/.config/ferium
 
 sudo -u minecraft expect -c "
-  set timeout 30
+  set timeout 60
   spawn ferium modpack add $PROJECT_ID
-  expect {
-    -nocase \"output directory\" {
-      send \"/opt/minecraft/server\r\"
-      exp_continue
-    }
-    -nocase \"overrides\" {
-      send \"y\r\"
-      exp_continue
-    }
-    eof
-  }
+  
+  expect \"installed to?\"
+  sleep 1
+  send \"/opt/minecraft/server\r\"
+  
+  expect \"overrides be installed?\"
+  sleep 1
+  send \"y\r\"
+  
+  expect eof
 "
 
 # Now that it's configured, upgrade to download the files
@@ -105,13 +107,23 @@ fi
 
 # 5. Parse Manifest & Install Loader
 cd /opt/minecraft/server
+
+# Ferium does not extract manifest.json, so we provide fallback parameters
 if [ ! -f manifest.json ]; then
-  send_discord_alert "Server Launch Failed" "Critical Error: \`manifest.json\` not found after Ferium download." 16711680
-  exit 1
+  echo "manifest.json not found. Checking known parameters for Project ID $PROJECT_ID..."
+  if [ "$PROJECT_ID" == "1108726" ]; then
+    MC_VERSION="1.20.1"
+    # Forge 47.3.0 is the stable standard for 1.20.1 modpacks
+    LOADER_ID="forge-47.3.0"
+  else
+    send_discord_alert "Server Launch Failed" "Critical Error: \`manifest.json\` not found, and no fallback provided for ID $PROJECT_ID." 16711680
+    exit 1
+  fi
+else
+  MC_VERSION=$(jq -r '.minecraft.version' manifest.json)
+  LOADER_ID=$(jq -r '.minecraft.modLoaders[0].id' manifest.json)
 fi
 
-MC_VERSION=$(jq -r '.minecraft.version' manifest.json)
-LOADER_ID=$(jq -r '.minecraft.modLoaders[0].id' manifest.json)
 JAVA_CMD="/usr/bin/java"
 
 if [[ "$LOADER_ID" == fabric-* ]]; then
@@ -193,7 +205,7 @@ SERVICE
 # 8. Setup Online Notifier
 cat << SCRIPT > /opt/minecraft/discord_notifier.sh
 #!/bin/bash
-PUBLIC_IP=\$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+PUBLIC_IP=\$(curl -s --retry 5 checkip.amazonaws.com)
 until nc -z 127.0.0.1 25565; do
   sleep 5
 done
@@ -262,7 +274,14 @@ RestartSec=30s
 WantedBy=multi-user.target
 SERVICE
 
-# 10. Start Services
+# 10. Install Debug Script
+cat << 'EOF' > /opt/minecraft/debug.sh
+${debug_script_content}
+EOF
+chmod +x /opt/minecraft/debug.sh
+chown root:root /opt/minecraft/debug.sh
+
+# 11. Start Services
 systemctl daemon-reload
 systemctl enable minecraft minecraft-notifier minecraft-autoshutdown
 systemctl start minecraft
