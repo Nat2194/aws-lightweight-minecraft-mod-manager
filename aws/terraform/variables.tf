@@ -1,6 +1,6 @@
 variable "aws_region" {
   description = "The AWS region to deploy into"
-  default     = "eu-west-1" # To be updated
+  default     = "eu-west-3" # To be updated
 }
 
 variable "instance_type" {

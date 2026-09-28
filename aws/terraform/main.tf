@@ -44,9 +44,26 @@ resource "aws_security_group" "mc_sg" {
   name   = "minecraft-ephemeral-sg"
   vpc_id = aws_vpc.mc_vpc.id
   
-  ingress { from_port = 25565, to_port = 25565, protocol = "tcp", cidr_blocks = ["0.0.0.0/0"] }
-  ingress { from_port = 22, to_port = 22, protocol = "tcp", cidr_blocks = [var.admin_ip] }
-  egress  { from_port = 0, to_port = 0, protocol = "-1", cidr_blocks = ["0.0.0.0/0"] }
+  ingress {
+    from_port   = 25565
+    to_port     = 25565
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.admin_ip]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 }
 
 # --- 3. IAM (Allows EC2 to read/write to the S3 bucket) ---
@@ -85,7 +102,11 @@ resource "aws_iam_instance_profile" "mc_profile" {
 data "aws_ami" "ubuntu_arm" {
   most_recent = true
   owners      = ["099720109477"]
-  filter { name = "name", values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"] }
+  
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"]
+  }
 }
 
 resource "aws_instance" "mc_server" {

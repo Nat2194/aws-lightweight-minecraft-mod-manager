@@ -2,13 +2,14 @@
 set -e
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: ./manager.sh [up|down] <curseforge_project_id>"
-    echo "Example: ./manager.sh up 396246"
+    echo "Usage: ./manager.sh [up|down] <curseforge_project_id> [--skip-bucket]"
+    echo "Example: ./manager.sh up 1108726"
     exit 1
 fi
 
 ACTION=$1
 PROJECT_ID=$2
+FLAG=$3
 
 # Load environment variables from .env file if it exists
 if [ -f .env ]; then
@@ -29,9 +30,21 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 BUCKET_NAME="mc-ephemeral-worlds-${ACCOUNT_ID}"
 
 if [ "$ACTION" == "up" ]; then
+    # Check if the bucket exists
     if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
-        echo "Creating S3 bucket $BUCKET_NAME for persistent world storage..."
-        aws s3 mb s3://"$BUCKET_NAME"
+        if [ "$FLAG" == "--skip-bucket" ]; then
+            echo "Skipping S3 bucket creation as requested via flag."
+        else
+            echo "S3 bucket '$BUCKET_NAME' does not exist."
+            read -p "Do you want to create it now for world backups? (y/n) " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                echo "Creating S3 bucket $BUCKET_NAME..."
+                aws s3 mb s3://"$BUCKET_NAME"
+            else
+                echo "Warning: Running without an S3 bucket. World saves and configs will NOT be backed up upon shutdown!"
+            fi
+        fi
     fi
 
     cd terraform
@@ -40,7 +53,7 @@ if [ "$ACTION" == "up" ]; then
     cd ..
 
 elif [ "$ACTION" == "down" ]; then
-    echo "Destroying infrastructure. The server will automatically backup to S3 before dying."
+    echo "Destroying infrastructure. The server will attempt to backup to S3 before dying."
     cd terraform
     terraform destroy -var="curseforge_project_id=$PROJECT_ID" -var="s3_bucket=$BUCKET_NAME" -auto-approve
     cd ..
